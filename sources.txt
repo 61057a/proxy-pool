@@ -1,0 +1,17 @@
+# 代理源列表：一行一个 URL，抓回来的内容会按 ip:port 逐行解析
+# 以 # 开头的行会被忽略
+#
+# 默认用 jsDelivr CDN 镜像 GitHub 上的公开列表（国内可直连）。
+# 原始仓库（直连不通时不要用 raw.githubusercontent.com）：
+#   https://github.com/TheSpeedX/PROXY-List
+#   https://github.com/monosans/proxy-list
+#   https://github.com/proxifly/free-proxy-list
+#   https://github.com/zloi-user/hideip.me
+#
+# CDN 地址格式： https://cdn.jsdelivr.net/gh/用户/仓库@分支/路径
+# 也可以用 gh-proxy 镜像： https://gh-proxy.com/https://raw.githubusercontent.com/用户/仓库/分支/路径
+
+https://cdn.jsdelivr.net/gh/TheSpeedX/PROXY-List@master/http.txt
+https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/http.txt
+https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt
+https://cdn.jsdelivr.net/gh/zloi-user/hideip.me@main/http.txt
