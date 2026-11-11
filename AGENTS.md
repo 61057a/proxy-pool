@@ -134,6 +134,47 @@ findstr /S /I /N /C:"ghp_" /C:"api_key" /C:"apikey" /C:"secret" /C:"password" sr
 **不是**凭据，属于正常命中。）
 
 - 用户目录、本机绝对路径、个人配置：代码里用 `GetModuleFileName` 取 exe 目录拼相对路径
+- 本机凭据文件 `%USERPROFILE%\.config\github\gh_token.sec`（见 5.1）：不要复制进仓库，
+  也不要 `cat` / `Get-Content` 打印内容到日志或聊天
+
+### 5.1 GitHub 凭据（本机已保存，不在仓库里）
+
+本机（Windows 用户 `kkksc04`）已经把 token 用 **DPAPI 加密**保存在仓库之外的目录，
+只有当前 Windows 用户能解密：
+
+```
+%USERPROFILE%\.config\github\gh_token.sec
+= C:\Users\kkksc04\.config\github\gh_token.sec
+```
+
+需要调 GitHub API（建库、发 Release、改仓库简介 / 主页 / topics）时，在**当前 PowerShell 进程**里载入：
+
+```powershell
+$sec  = Get-Content "$env:USERPROFILE\.config\github\gh_token.sec" | ConvertTo-SecureString
+$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+$env:GH_TOKEN = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+
+gh api user -q .login     # 应输出 61057a
+```
+
+载入后 `gh` 的建库、`gh release create`、`gh repo edit`、`gh api` 全部可用。
+
+- 该 token 的 scope 只有 `repo`，够本仓库用；**缺 `read:org`**，所以
+  `gh auth login --with-token` 会报 `missing required scope 'read:org'`，
+  不要走 `gh auth login`，直接用 `GH_TOKEN` 环境变量
+- `$env:GH_TOKEN` 只对当前进程有效，命令结束即失效，不会残留在系统里
+- **绝对不要**把 token 明文写进 `AGENTS.md`、源码、提交信息或 Release 说明：
+  本仓库是公开的，GitHub 会扫描并自动吊销泄露的 token
+- 换机器 / 换用户时自行生成：GitHub → Settings → Developer settings → Personal access tokens，
+  勾 `repo`，然后写入加密文件：
+
+```powershell
+'<新token>' | ConvertTo-SecureString -AsPlainText -Force |
+    ConvertFrom-SecureString | Set-Content "$env:USERPROFILE\.config\github\gh_token.sec" -NoNewline
+```
+
+- 当前 token 没有设置过期时间，建议每 3~6 个月轮换一次；怀疑泄露立刻在 GitHub 撤销
 
 ---
 
@@ -181,10 +222,9 @@ $z.Dispose()
 
 ### 7.2 创建 Release
 
-`gh` 在本机可能未登录；用 token 时只在当前进程里设环境变量，**不要写进任何文件或仓库**：
+先按 [5.1](#51-github-凭据本机已保存不在仓库里) 载入 `GH_TOKEN`，然后：
 
 ```powershell
-$env:GH_TOKEN = '<token>'
 gh release create v1.0.0 "$env:TEMP\proxypool-v1.0.0-win64.zip" `
   --repo 61057a/proxy-pool `
   --title "v1.0.0" `
@@ -199,7 +239,7 @@ gh release create v1.0.0 "$env:TEMP\proxypool-v1.0.0-win64.zip" `
 gh release view v1.0.0 --repo 61057a/proxy-pool
 ```
 
-- 发布后立刻 `Remove-Item Env:\GH_TOKEN`，并提醒人类去 GitHub 撤销该 token
+- 发布后执行 `Remove-Item Env:\GH_TOKEN` 清理当前进程即可；token 本身保存在 5.1 的加密文件里，**不要撤销**
 - 补发资产用 `gh release upload v1.0.0 <file> --clobber`
 
 ### 7.3 版本号同步
