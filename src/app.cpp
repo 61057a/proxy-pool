@@ -51,9 +51,9 @@ std::string RefreshStatus::stage() const {
 }
 
 Options::Options()
-    : port(8080), threads(64), timeoutMs(3000), refreshSec(600), maxProxies(100), minPool(10),
-      host("127.0.0.1"), sourcesFile("sources.txt"), checkUrl("http://icanhazip.com/"),
-      once(false), verbose(false), noValidate(false) {}
+    : port(8080), ctlPort(-1), threads(64), timeoutMs(3000), refreshSec(600), maxProxies(100),
+      minPool(10), host("127.0.0.1"), sourcesFile("sources.txt"),
+      checkUrl("http://icanhazip.com/"), once(false), verbose(false), noValidate(false) {}
 
 namespace {
 
@@ -225,6 +225,7 @@ void printUsage() {
         "  proxypool-gui.exe         图形界面（可手动选择节点）\n\n"
         "选项（两种模式通用）:\n"
         "  --port N        本地监听端口，默认 8080\n"
+        "  --ctl-port N    本机控制接口端口（127.0.0.1），默认 port+1；0 表示关闭\n"
         "  --host IP       绑定地址，默认 127.0.0.1（局域网共享用 0.0.0.0）\n"
         "  --sources FILE  代理源列表文件，默认 exe 同目录 sources.txt\n"
         "  --threads N     校验并发数，默认 64\n"
@@ -239,7 +240,12 @@ void printUsage() {
         "  -h, --help      显示本帮助\n\n"
         "示例:\n"
         "  proxypool --port 8080\n"
-        "  curl -x http://127.0.0.1:8080 https://api.ipify.org\n\n");
+        "  curl -x http://127.0.0.1:8080 https://api.ipify.org\n\n"
+        "控制接口（仅绑 127.0.0.1，给启动器 / 脚本用）:\n"
+        "  curl http://127.0.0.1:8081/status\n"
+        "  curl http://127.0.0.1:8081/fixed\n"
+        "  curl \"http://127.0.0.1:8081/rotate?dead=1.2.3.4:8080&ttl=3600\"\n"
+        "  curl http://127.0.0.1:8081/auto\n\n");
 }
 
 bool parseArgv(const std::vector<std::string>& args, Options& o, bool& help, std::string& err) {
@@ -249,6 +255,7 @@ bool parseArgv(const std::vector<std::string>& args, Options& o, bool& help, std
 
         if (a == "-h" || a == "--help") { help = true; return true; }
         else if (a == "--port") { if (!hasVal) { err = "--port 缺少参数"; return false; } o.port = std::atoi(args[++i].c_str()); }
+        else if (a == "--ctl-port") { if (!hasVal) { err = "--ctl-port 缺少参数"; return false; } o.ctlPort = std::atoi(args[++i].c_str()); }
         else if (a == "--host") { if (!hasVal) { err = "--host 缺少参数"; return false; } o.host = args[++i]; }
         else if (a == "--sources") { if (!hasVal) { err = "--sources 缺少参数"; return false; } o.sourcesFile = args[++i]; }
         else if (a == "--threads") { if (!hasVal) { err = "--threads 缺少参数"; return false; } o.threads = std::atoi(args[++i].c_str()); }
@@ -264,6 +271,8 @@ bool parseArgv(const std::vector<std::string>& args, Options& o, bool& help, std
     }
 
     if (o.port <= 0 || o.port > 65535) { err = "端口不合法"; return false; }
+    if (o.ctlPort < 0) o.ctlPort = (o.port < 65535) ? o.port + 1 : 0;
+    if (o.ctlPort > 65535) { err = "控制端口不合法"; return false; }
     if (o.threads < 1 || o.threads > 512) { err = "线程数应在 1..512"; return false; }
     if (o.timeoutMs < 200 || o.timeoutMs > 60000) { err = "超时应在 200..60000 ms"; return false; }
     if (o.maxProxies < 1) o.maxProxies = 1;

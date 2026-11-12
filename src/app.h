@@ -12,6 +12,7 @@ namespace pp {
 
 struct Options {
     int port;
+    int ctlPort;   // 本机控制接口，-1 = 自动用 port+1，0 = 关闭
     int threads;
     int timeoutMs;
     int refreshSec;

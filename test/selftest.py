@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import urllib.request
+import http.client
 
 ROOT = __file__.rsplit("\\", 2)[0]
 EXE = ROOT + r"\dist\proxypool.exe"
@@ -90,6 +91,14 @@ def handle_fake(c):
             pass
 
 
+def control(path):
+    c = http.client.HTTPConnection("127.0.0.1", LOCAL_PORT + 1, timeout=5)
+    c.request("GET", path)
+    body = c.getresponse().read().decode("utf-8", "replace")
+    c.close()
+    return body
+
+
 def wait_port(port, timeout=20.0):
     end = time.time() + timeout
     while time.time() < end:
@@ -152,7 +161,41 @@ def main():
     except Exception as e:
         failures.append("CONNECT 失败: %s" % e)
 
-    # 3) 池空了应返回 5xx 而不是挂住
+    # 3) 控制接口：固定出口 / 换出口 / 恢复轮换
+    try:
+        st = control("/status")
+        if "ok=1" in st and "mode=auto" in st:
+            print("PASS /status")
+        else:
+            failures.append("/status 返回异常: %r" % st)
+
+        fx = control("/fixed")
+        if "ok=1" in fx and "127.0.0.1:%d" % PROXY_PORT in fx:
+            print("PASS /fixed 固定出口")
+        else:
+            failures.append("/fixed 返回异常: %r" % fx)
+
+        st = control("/status")
+        if "mode=fixed" in st and "pinned=127.0.0.1:%d" % PROXY_PORT in st:
+            print("PASS /status 反映固定节点")
+        else:
+            failures.append("/status 未反映固定节点: %r" % st)
+
+        ro = control("/rotate?dead=127.0.0.1:%d&ttl=60" % PROXY_PORT)
+        if "ok=0" in ro:
+            print("PASS /rotate 无备用节点时如实返回 ok=0")
+        else:
+            failures.append("/rotate 无备用节点时返回异常: %r" % ro)
+
+        au = control("/auto")
+        if "mode=auto" in au:
+            print("PASS /auto 恢复轮换")
+        else:
+            failures.append("/auto 返回异常: %r" % au)
+    except Exception as e:
+        failures.append("控制接口失败: %s" % e)
+
+    # 4) 池空了应返回 5xx 而不是挂住
     stop.set()
     time.sleep(1)
     try:

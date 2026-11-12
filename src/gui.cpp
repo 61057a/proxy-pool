@@ -679,7 +679,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     g_ui.tickBase = GetTickCount64();
 
     // 本地代理服务（先绑定端口，节点稍后填充）
-    g_ui.server = new ProxyServer(*g_ui.pool, opt->host, opt->port, opt->timeoutMs);
+    g_ui.server = new ProxyServer(*g_ui.pool, opt->host, opt->port, opt->timeoutMs, opt->ctlPort);
     std::string serr;
     if (!g_ui.server->start(serr)) {
         MessageBoxW(NULL, Widen("本地代理启动失败：" + serr).c_str(), L"proxypool",

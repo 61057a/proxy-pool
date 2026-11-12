@@ -6,6 +6,8 @@
 #include <vector>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
+#include <sstream>
 
 namespace pp {
 
@@ -60,10 +62,58 @@ static void relay(SOCKET a, SOCKET b) {
     t.join();
 }
 
+static void sendControlResponse(SOCKET s, const std::string& body) {
+    char head[256];
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 200 OK\r\n"
+             "Content-Type: text/plain; charset=utf-8\r\n"
+             "Content-Length: %u\r\n"
+             "Cache-Control: no-store\r\n"
+             "Connection: close\r\n\r\n",
+             (unsigned)body.size());
+    sendAll(s, head, strlen(head));
+    sendAll(s, body.data(), body.size());
+}
+
+// 从 "/rotate?dead=1.2.3.4:8080&ttl=3600" 里取参数；不做 URL 解码，
+// 控制接口只接受 ASCII 节点 key 和数字。
+static std::string queryParam(const std::string& target, const char* name) {
+    size_t q = target.find('?');
+    if (q == std::string::npos) return std::string();
+    std::string query = target.substr(q + 1);
+    std::string key(name);
+    size_t pos = 0;
+    while (pos <= query.size()) {
+        size_t amp = query.find('&', pos);
+        std::string pair = (amp == std::string::npos)
+                               ? query.substr(pos)
+                               : query.substr(pos, amp - pos);
+        size_t eq = pair.find('=');
+        if (eq != std::string::npos && pair.substr(0, eq) == key)
+            return pair.substr(eq + 1);
+        if (amp == std::string::npos) break;
+        pos = amp + 1;
+    }
+    return std::string();
+}
+
+// 节点 key 只允许 ip/域名 + 端口，避免把控制参数原样写进日志或状态
+static bool saneKey(const std::string& key) {
+    if (key.empty() || key.size() > 128) return false;
+    for (size_t i = 0; i < key.size(); ++i) {
+        char c = key[i];
+        bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                  (c >= 'A' && c <= 'Z') || c == '.' || c == ':' || c == '-' || c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 ProxyServer::ProxyServer(ProxyPool& pool, const std::string& bindHost, int port,
-                         int connectTimeoutMs)
+                         int connectTimeoutMs, int controlPort)
     : pool_(pool), bindHost_(bindHost), port_(port), connectTimeoutMs_(connectTimeoutMs),
-      stopping_(false), listen_(INVALID_SOCKET), served_(0), failed_(0) {}
+      stopping_(false), listen_(INVALID_SOCKET), served_(0), failed_(0),
+      ctlPort_(controlPort), ctlListen_(INVALID_SOCKET), ctlStopping_(false) {}
 
 ProxyServer::~ProxyServer() { stop(); }
 
@@ -117,6 +167,32 @@ bool ProxyServer::start(std::string& err) {
         listen_ = INVALID_SOCKET;
         return false;
     }
+
+    // 控制接口只绑本机，和代理端口分开，避免外部机器直接操作固定节点
+    if (ctlPort_ > 0 && ctlPort_ != port_) {
+        SOCKET c = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (c != INVALID_SOCKET) {
+            BOOL exclusive = TRUE;
+            setsockopt(c, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                       (const char*)&exclusive, sizeof(exclusive));
+
+            sockaddr_in ca;
+            ZeroMemory(&ca, sizeof(ca));
+            ca.sin_family = AF_INET;
+            ca.sin_port = htons((u_short)ctlPort_);
+            ca.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+            if (bind(c, (sockaddr*)&ca, sizeof(ca)) == 0 &&
+                listen(c, SOMAXCONN) != SOCKET_ERROR) {
+                ctlListen_ = c;
+                std::thread(&ProxyServer::runControl, this).detach();
+                logf(LV_INFO, "控制接口 http://127.0.0.1:%d/status", ctlPort_);
+            } else {
+                logf(LV_WARN, "控制接口 %d 启动失败，固定出口 / 自动换出口不可用", ctlPort_);
+                closesocket(c);
+            }
+        }
+    }
     return true;
 }
 
@@ -125,6 +201,11 @@ void ProxyServer::stop() {
     if (listen_ != INVALID_SOCKET) {
         closesocket(listen_);
         listen_ = INVALID_SOCKET;
+    }
+    ctlStopping_ = true;
+    if (ctlListen_ != INVALID_SOCKET) {
+        closesocket(ctlListen_);
+        ctlListen_ = INVALID_SOCKET;
     }
 }
 
@@ -266,6 +347,170 @@ void ProxyServer::logStatsIfNeeded() {
         logf(LV_INFO, "已转发 %s 条请求，失败 %s 条，池内可用 %u 个",
              s.c_str(), f.c_str(), (unsigned)pool_.size());
     }
+}
+
+void ProxyServer::runControl() {
+    while (!ctlStopping_) {
+        SOCKET c = accept(ctlListen_, NULL, NULL);
+        if (c == INVALID_SOCKET) {
+            if (ctlStopping_) break;
+            continue;
+        }
+        std::thread(&ProxyServer::handleControl, this, c).detach();
+    }
+}
+
+void ProxyServer::handleControl(SOCKET client) {
+    SockHolder holder;
+    holder.s = client;
+    setIoTimeouts(client, 3000);
+
+    std::string head;
+    if (!readHeaders(client, head, 16 * 1024)) return;
+
+    size_t lineEnd = head.find("\r\n");
+    std::string reqLine = head.substr(0, lineEnd);
+    size_t sp1 = reqLine.find(' ');
+    size_t sp2 = (sp1 == std::string::npos) ? std::string::npos
+                                            : reqLine.find(' ', sp1 + 1);
+    std::string target;
+    if (sp1 != std::string::npos && sp2 != std::string::npos)
+        target = reqLine.substr(sp1 + 1, sp2 - sp1 - 1);
+
+    std::string body = controlResponse(target);
+    sendControlResponse(client, body);
+}
+
+void ProxyServer::pruneQuotaDeadLocked() {
+    long long now = nowMs();
+    for (std::map<std::string, long long>::iterator it = quotaDead_.begin();
+         it != quotaDead_.end();) {
+        if (it->second <= now)
+            quotaDead_.erase(it++);
+        else
+            ++it;
+    }
+}
+
+bool ProxyServer::chooseFixedLocked(std::string& out) {
+    pruneQuotaDeadLocked();
+    std::vector<Proxy> list = pool_.snapshot();
+    std::string cur = pool_.pinned();
+
+    // 已经固定在一个健康节点上就不要动，避免重复调用时出口 IP 乱跳
+    if (!cur.empty()) {
+        for (size_t i = 0; i < list.size(); ++i) {
+            if (list[i].key() == cur && list[i].fails < 3 &&
+                quotaDead_.find(cur) == quotaDead_.end()) {
+                out = cur;
+                return true;
+            }
+        }
+    }
+
+    // install() 已按延迟排序，取第一个健康的、没被标记额度用尽的
+    for (size_t i = 0; i < list.size(); ++i) {
+        if (list[i].fails < 3 && quotaDead_.find(list[i].key()) == quotaDead_.end()) {
+            out = list[i].key();
+            pool_.pin(out);
+            logf(LV_INFO, "控制接口固定出口 %s", out.c_str());
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ProxyServer::chooseRotateLocked(const std::string& dead, int ttlSec, std::string& out) {
+    pruneQuotaDeadLocked();
+    if (!dead.empty()) {
+        quotaDead_[dead] = nowMs() + (long long)ttlSec * 1000;
+        logf(LV_INFO, "节点 %s 额度用尽，%d 秒内不再使用", dead.c_str(), ttlSec);
+    }
+
+    std::vector<Proxy> list = pool_.snapshot();
+    std::string cur = pool_.pinned();
+
+    size_t start = 0;
+    if (!cur.empty()) {
+        for (size_t i = 0; i < list.size(); ++i) {
+            if (list[i].key() == cur) {
+                start = i + 1;
+                break;
+            }
+        }
+    }
+
+    size_t n = list.size();
+    for (size_t i = 0; i < n; ++i) {
+        size_t idx = (start + i) % n;
+        const std::string& key = list[idx].key();
+        // 绕一圈回到自己不算“换出口”
+        if (!cur.empty() && key == cur) continue;
+        if (list[idx].fails < 3 && quotaDead_.find(key) == quotaDead_.end()) {
+            out = key;
+            pool_.pin(out);
+            logf(LV_INFO, "控制接口切换出口 %s", out.c_str());
+            return true;
+        }
+    }
+
+    if (!cur.empty()) out = cur;
+    return false;
+}
+
+std::string ProxyServer::controlResponse(const std::string& target) {
+    size_t q = target.find('?');
+    std::string path = (q == std::string::npos) ? target : target.substr(0, q);
+
+    std::ostringstream ss;
+    std::lock_guard<std::mutex> lk(ctlMu_);
+
+    if (path == "/status") {
+        std::string pinned = pool_.pinned();
+        ss << "ok=1\n"
+           << "mode=" << (pinned.empty() ? "auto" : "fixed") << "\n"
+           << "pinned=" << pinned << "\n"
+           << "size=" << (unsigned)pool_.size() << "\n"
+           << "total=" << (unsigned)pool_.total() << "\n"
+           << "served=" << served_.load() << "\n"
+           << "failed=" << failed_.load() << "\n"
+           << "quota_dead=" << (unsigned)quotaDead_.size() << "\n";
+        return ss.str();
+    }
+
+    if (path == "/fixed") {
+        std::string key;
+        if (chooseFixedLocked(key))
+            ss << "ok=1\npinned=" << key << "\n";
+        else
+            ss << "ok=0\npinned=\nreason=no healthy node\n";
+        return ss.str();
+    }
+
+    if (path == "/rotate") {
+        std::string dead = queryParam(target, "dead");
+        if (!saneKey(dead)) dead.clear();
+        int ttlSec = std::atoi(queryParam(target, "ttl").c_str());
+        if (ttlSec < 60) ttlSec = 3600;
+        if (ttlSec > 86400 * 7) ttlSec = 86400 * 7;
+
+        std::string key;
+        if (chooseRotateLocked(dead, ttlSec, key))
+            ss << "ok=1\npinned=" << key << "\n";
+        else
+            ss << "ok=0\npinned=" << key << "\nreason=no alternative node\n";
+        return ss.str();
+    }
+
+    if (path == "/auto") {
+        pool_.pin("");
+        ss << "ok=1\nmode=auto\n";
+        logf(LV_INFO, "控制接口恢复自动轮换");
+        return ss.str();
+    }
+
+    ss << "ok=0\nreason=unknown endpoint\n";
+    return ss.str();
 }
 
 } // namespace pp

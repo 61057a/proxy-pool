@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    ProxyServer server(pool, o.host, o.port, o.timeoutMs);
+    ProxyServer server(pool, o.host, o.port, o.timeoutMs, o.ctlPort);
     std::string serr;
     if (!server.start(serr)) {
         logf(LV_ERROR, "本地代理启动失败：%s", serr.c_str());
